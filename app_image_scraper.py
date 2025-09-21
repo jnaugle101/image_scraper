@@ -15,6 +15,15 @@ try:
 except Exception:
     HAVE_PIL = False
 
+from bs4 import BeautifulSoup
+
+def make_soup(html: str) -> BeautifulSoup:
+    try:
+        # Use lxml if Render happened to build it; otherwise fallback
+        return BeautifulSoup(html, "lxml")
+    except Exception:
+        return BeautifulSoup(html, "html.parser")
+
 # ---------- Config ----------
 DEFAULT_UA = "ImageScraper/1.0 (+for personal use)"
 ALLOWED_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
@@ -79,8 +88,9 @@ async def fetch_bytes(session: aiohttp.ClientSession, url: str) -> tuple[bytes |
 
 # ---------- HTML parsing ----------
 def parse_images_and_links(html: str, base_url: str) -> tuple[list[str], list[str]]:
-    soup = BeautifulSoup(html, "lxml")
+    soup = make_soup(html)   # <-- was BeautifulSoup(html, "lxml")
     imgs, links = [], []
+    ...
 
     # <img src> + srcset
     for img in soup.find_all("img"):
