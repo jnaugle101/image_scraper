@@ -1,37 +1,34 @@
-
-
 #!/usr/bin/env python3
-import asyncio, logging, re, io, hashlib, zipfile
+import asyncio, re, io, hashlib, zipfile
 from urllib.parse import urljoin, urlsplit
-from pathlib import Path
 
 import aiohttp
 from bs4 import BeautifulSoup
 import streamlit as st
 
+# Optional Pillow verification (can reject corrupt/odd images)
 try:
-    from PIL import Image as PILImage  # optional verification
+    from PIL import Image as PILImage
     HAVE_PIL = True
 except Exception:
     HAVE_PIL = False
 
-from bs4 import BeautifulSoup
-
-def make_soup(html: str) -> BeautifulSoup:
-    try:
-        # Use lxml if Render happened to build it; otherwise fallback
-        return BeautifulSoup(html, "lxml")
-    except Exception:
-        return BeautifulSoup(html, "html.parser")
-
 # ---------- Config ----------
 DEFAULT_UA = "ImageScraper/1.0 (+for personal use)"
-ALLOWED_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
-ALLOWED_MIMES = {"image/jpeg","image/png","image/gif","image/webp","image/bmp"}
+ALLOWED_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}   # (intentionally excludes .svg)
+ALLOWED_MIMES = {"image/jpeg", "image/png", "image/gif", "image/webp", "image/bmp"}
 TIMEOUT = aiohttp.ClientTimeout(total=25)
 SRCSET_SPLIT = re.compile(r"\s*,\s*")
 IMG_URL_IN_STYLE = re.compile(r"url\((['\"]?)([^)'\"]+)\1\)")
 ROBOTS_CACHE = {}  # host -> {"*":[disallows]}
+
+# ---------- Parser helper ----------
+def make_soup(html: str) -> BeautifulSoup:
+    """Use lxml if available; fall back to built-in html.parser."""
+    try:
+        return BeautifulSoup(html, "lxml")
+    except Exception:
+        return BeautifulSoup(html, "html.parser")
 
 # ---------- Small utils ----------
 def norm_url(u: str) -> str:
@@ -68,7 +65,8 @@ async def fetch_text(session: aiohttp.ClientSession, url: str) -> str | None:
         async with session.get(url, timeout=TIMEOUT) as r:
             if r.status != 200:
                 return None
-            if "text/html" not in (r.headers.get("content-type") or ""):
+            ctype = (r.headers.get("content-type") or "").lower()
+            if "text/html" not in ctype:
                 return None
             return await r.text(errors="ignore")
     except Exception:
@@ -88,9 +86,8 @@ async def fetch_bytes(session: aiohttp.ClientSession, url: str) -> tuple[bytes |
 
 # ---------- HTML parsing ----------
 def parse_images_and_links(html: str, base_url: str) -> tuple[list[str], list[str]]:
-    soup = make_soup(html)   # <-- was BeautifulSoup(html, "lxml")
+    soup = make_soup(html)
     imgs, links = [], []
-    ...
 
     # <img src> + srcset
     for img in soup.find_all("img"):
@@ -121,7 +118,7 @@ def parse_images_and_links(html: str, base_url: str) -> tuple[list[str], list[st
     # links to crawl
     for a in soup.find_all("a"):
         href = a.get("href")
-        if not href or href.startswith(("#","mailto:","javascript:")):
+        if not href or href.startswith(("#", "mailto:", "javascript:")):
             continue
         links.append(urljoin(base_url, href))
 
@@ -130,8 +127,9 @@ def parse_images_and_links(html: str, base_url: str) -> tuple[list[str], list[st
         out = []
         seen = set()
         for u in lst:
-            if urlsplit(u).scheme in {"http","https"} and u not in seen:
-                seen.add(u); out.append(u)
+            if urlsplit(u).scheme in {"http", "https"} and u not in seen:
+                seen.add(u)
+                out.append(u)
         return out
 
     return uniq_http(imgs), uniq_http(links)
@@ -145,11 +143,11 @@ def parse_robots(text: str) -> dict:
         if not line or line.startswith("#"):
             continue
         if line.lower().startswith("user-agent:"):
-            agent = line.split(":",1)[1].strip().lower()
+            agent = line.split(":", 1)[1].strip().lower()
             current_agents = [agent]
             rules.setdefault(agent, [])
         elif line.lower().startswith("disallow:"):
-            path = line.split(":",1)[1].strip() or "/"
+            path = line.split(":", 1)[1].strip() or "/"
             for a in current_agents or ["*"]:
                 rules.setdefault(a, []).append(path)
     return {"*": rules.get("*", [])}
@@ -226,20 +224,30 @@ async def crawl_images(
 
                 imgs, links = parse_images_and_links(html, url)
 
-                # schedule image downloads (limited)
+                # schedule image downloads (limited) with robust filtering
                 for img_url in imgs:
                     if len(images) >= max_images:
                         break
-                    # fetch bytes
+
                     async with sem:
                         data, mime = await fetch_bytes(session, img_url)
                     if not data or len(data) < min_bytes:
                         continue
+
+                    # Accept only known image types by mime or file extension (skip svg/others)
+                    ext = ext_from_url(img_url).lower()
+                    mime_ok = mime in ALLOWED_MIMES
+                    ext_ok  = ext in ALLOWED_EXTS
+                    if not (mime_ok or ext_ok):
+                        continue
+
+                    # Optional: verify with Pillow
                     if verify_with_pillow and HAVE_PIL:
                         try:
                             PILImage.open(io.BytesIO(data)).verify()
                         except Exception:
                             continue
+
                     digest = sha256(data)
                     if digest in seen_img_hashes:
                         continue
@@ -302,20 +310,33 @@ if submitted:
     total = len(images)
     st.success(f"Found {total} image(s).")
 
-    # Inline preview (first N as thumbnails)
+    # Inline preview (first N) — filter to previewable images only
     if show_limit and total:
-        previews = [io.BytesIO(img["data"]).getvalue() for img in images[:show_limit]]
-        caps = [urlsplit(img["url"]).path.rsplit("/", 1)[-1] or "(image)" for img in images[:show_limit]]
-        st.image(previews, caption=caps, use_container_width=True)
+        previews, caps = [], []
+        for img in images[:show_limit]:
+            ext = ext_from_url(img["url"]).lower()
+            if not (img["mime"] in ALLOWED_MIMES or ext in ALLOWED_EXTS):
+                continue
+            if HAVE_PIL:
+                try:
+                    PILImage.open(io.BytesIO(img["data"])).verify()
+                except Exception:
+                    continue
+            previews.append(img["data"])
+            caps.append(urlsplit(img["url"]).path.rsplit("/", 1)[-1] or "(image)")
+
+        if previews:
+            st.image(previews, caption=caps, use_container_width=True)
+        else:
+            st.info("No previewable images to display. Try increasing the show limit or disabling Pillow verification.")
 
     # Build a ZIP so the user can download
     if total:
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
             for img in images:
-                # pick an extension
                 ext = ext_from_mime(img["mime"]) or ext_from_url(img["url"]) or ".bin"
-                name = (img["sha"] + ext)
+                name = img["sha"] + ext
                 zf.writestr(name, img["data"])
         buf.seek(0)
         st.download_button(
