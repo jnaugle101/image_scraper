@@ -306,7 +306,7 @@ if submitted:
     if show_limit and total:
         previews = [io.BytesIO(img["data"]).getvalue() for img in images[:show_limit]]
         caps = [urlsplit(img["url"]).path.rsplit("/", 1)[-1] or "(image)" for img in images[:show_limit]]
-        st.image(previews, caption=caps, use_column_width=True)
+        st.image(previews, caption=caps, use_container_width=True)
 
     # Build a ZIP so the user can download
     if total:
